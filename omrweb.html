@@ -1,0 +1,475 @@
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for
+import cv2
+import numpy as np
+import os
+from werkzeug.utils import secure_filename
+import json
+import sqlite3
+from datetime import datetime
+import pandas as pd
+from PIL import Image
+import io
+import base64
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.secret_key = 'your-secret-key-here'
+
+# Ensure upload directory exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Initialize database
+def init_db():
+    conn = sqlite3.connect('omr_results.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            exam_version TEXT,
+            subject1_score INTEGER,
+            subject2_score INTEGER,
+            subject3_score INTEGER,
+            subject4_score INTEGER,
+            subject5_score INTEGER,
+            total_score INTEGER,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            image_path TEXT,
+            raw_answers TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS answer_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_version TEXT UNIQUE,
+            answers TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+class OMRProcessor:
+    def __init__(self):
+        self.answer_keys = {
+            'A': ['A'] * 20 + ['B'] * 20 + ['C'] * 20 + ['D'] * 20 + ['A'] * 20,  # Sample answer key
+            'B': ['B'] * 20 + ['C'] * 20 + ['D'] * 20 + ['A'] * 20 + ['B'] * 20,  # Sample answer key
+        }
+    
+    def preprocess_image(self, image):
+        """Preprocess the OMR sheet image"""
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Apply adaptive threshold
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        
+        return thresh
+    
+    def detect_contours(self, thresh_image):
+        """Detect and filter contours for bubble detection"""
+        contours, _ = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours based on area and aspect ratio
+        bubble_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if 50 < area < 500:  # Adjust based on bubble size
+                x, y, w, h = cv2.boundingRect(contour)
+                aspect_ratio = float(w) / h
+                if 0.7 < aspect_ratio < 1.3:  # Nearly circular
+                    bubble_contours.append(contour)
+        
+        return bubble_contours
+    
+    def extract_answers(self, image, num_questions=100, options_per_question=4):
+        """Extract answers from OMR sheet"""
+        # Preprocess image
+        thresh = self.preprocess_image(image)
+        
+        # Detect bubble contours
+        contours = self.detect_contours(thresh)
+        
+        # Sort contours by position (top to bottom, left to right)
+        contours = sorted(contours, key=lambda c: (cv2.boundingRect(c)[1], cv2.boundingRect(c)[0]))
+        
+        answers = []
+        
+        # Process contours in groups (assuming 4 options per question)
+        for i in range(0, min(len(contours), num_questions * options_per_question), options_per_question):
+            question_contours = contours[i:i+options_per_question]
+            
+            if len(question_contours) < options_per_question:
+                answers.append('X')  # Mark as invalid
+                continue
+            
+            # Check which bubble is filled
+            filled_option = None
+            max_fill = 0
+            
+            for j, contour in enumerate(question_contours):
+                # Create mask for contour
+                mask = np.zeros(thresh.shape, dtype=np.uint8)
+                cv2.drawContours(mask, [contour], -1, 255, -1)
+                
+                # Calculate fill ratio
+                masked_area = cv2.bitwise_and(thresh, mask)
+                fill_ratio = np.sum(masked_area == 0) / np.sum(mask == 255)
+                
+                if fill_ratio > max_fill and fill_ratio > 0.3:  # Threshold for filled bubble
+                    max_fill = fill_ratio
+                    filled_option = chr(65 + j)  # A, B, C, D
+            
+            answers.append(filled_option if filled_option else 'X')
+        
+        # Pad answers to 100 if necessary
+        while len(answers) < num_questions:
+            answers.append('X')
+        
+        return answers[:num_questions]
+    
+    def calculate_scores(self, answers, exam_version='A'):
+        """Calculate subject-wise and total scores"""
+        answer_key = self.answer_keys.get(exam_version, self.answer_keys['A'])
+        
+        scores = {'subject1': 0, 'subject2': 0, 'subject3': 0, 'subject4': 0, 'subject5': 0}
+        subject_names = list(scores.keys())
+        
+        for i, (student_ans, correct_ans) in enumerate(zip(answers, answer_key)):
+            if student_ans == correct_ans:
+                subject_idx = i // 20  # 20 questions per subject
+                if subject_idx < len(subject_names):
+                    scores[subject_names[subject_idx]] += 1
+        
+        total_score = sum(scores.values())
+        
+        return scores, total_score
+
+# Initialize the OMR processor
+omr_processor = OMRProcessor()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file selected'}), 400
+    
+    file = request.files['file']
+    student_id = request.form.get('student_id', 'Unknown')
+    exam_version = request.form.get('exam_version', 'A')
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if file:
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        try:
+            # Process the image
+            image = cv2.imread(filepath)
+            if image is None:
+                return jsonify({'error': 'Invalid image file'}), 400
+            
+            # Extract answers
+            answers = omr_processor.extract_answers(image)
+            
+            # Calculate scores
+            scores, total_score = omr_processor.calculate_scores(answers, exam_version)
+            
+            # Save to database
+            conn = sqlite3.connect('omr_results.db')
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO results 
+                (student_id, exam_version, subject1_score, subject2_score, subject3_score, 
+                 subject4_score, subject5_score, total_score, image_path, raw_answers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                student_id, exam_version, scores['subject1'], scores['subject2'], 
+                scores['subject3'], scores['subject4'], scores['subject5'], 
+                total_score, filepath, json.dumps(answers)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'student_id': student_id,
+                'exam_version': exam_version,
+                'scores': scores,
+                'total_score': total_score,
+                'answers': answers
+            })
+            
+        except Exception as e:
+            return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+
+@app.route('/results')
+def results():
+    conn = sqlite3.connect('omr_results.db')
+    df = pd.read_sql_query('SELECT * FROM results ORDER BY processed_at DESC', conn)
+    conn.close()
+    
+    return render_template('results.html', results=df.to_dict('records'))
+
+@app.route('/export')
+def export_results():
+    conn = sqlite3.connect('omr_results.db')
+    df = pd.read_sql_query('SELECT * FROM results', conn)
+    conn.close()
+    
+    # Create Excel file in memory
+    output = io.BytesIO()
+    df.to_excel(output, index=False)
+    output.seek(0)
+    
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=f'omr_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+@app.route('/dashboard')
+def dashboard():
+    conn = sqlite3.connect('omr_results.db')
+    cursor = conn.cursor()
+    
+    # Get summary statistics
+    cursor.execute('SELECT COUNT(*) as total_students FROM results')
+    total_students = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT AVG(total_score) as avg_score FROM results')
+    avg_score = cursor.fetchone()[0] or 0
+    
+    cursor.execute('SELECT exam_version, COUNT(*) as count FROM results GROUP BY exam_version')
+    version_stats = cursor.fetchall()
+    
+    conn.close()
+    
+    return render_template('dashboard.html', 
+                         total_students=total_students,
+                         avg_score=round(avg_score, 2),
+                         version_stats=version_stats)
+
+# HTML Templates (save these as separate files in templates/ folder)
+
+@app.route('/templates/base.html')
+def base_template():
+    return '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}OMR Evaluation System{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .navbar-brand { font-weight: bold; }
+        .card { box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
+        .btn-primary { background-color: #007bff; border-color: #007bff; }
+        .progress { height: 20px; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container">
+            <a class="navbar-brand" href="/">
+                <i class="fas fa-clipboard-check"></i> OMR Evaluation System
+            </a>
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="/"><i class="fas fa-home"></i> Home</a>
+                <a class="nav-link" href="/dashboard"><i class="fas fa-chart-bar"></i> Dashboard</a>
+                <a class="nav-link" href="/results"><i class="fas fa-list"></i> Results</a>
+                <a class="nav-link" href="/export"><i class="fas fa-download"></i> Export</a>
+            </div>
+        </div>
+    </nav>
+    
+    <div class="container mt-4">
+        {% block content %}{% endblock %}
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+    '''
+
+if __name__ == '__main__':
+    init_db()
+    
+    # Create templates directory and files
+    os.makedirs('templates', exist_ok=True)
+    
+    # Create index.html template
+    with open('templates/index.html', 'w') as f:
+        f.write('''
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8 mx-auto">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h4><i class="fas fa-upload"></i> Upload OMR Sheet</h4>
+            </div>
+            <div class="card-body">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label for="student_id" class="form-label">Student ID</label>
+                        <input type="text" class="form-control" id="student_id" name="student_id" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="exam_version" class="form-label">Exam Version</label>
+                        <select class="form-select" id="exam_version" name="exam_version" required>
+                            <option value="A">Version A</option>
+                            <option value="B">Version B</option>
+                            <option value="C">Version C</option>
+                            <option value="D">Version D</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="file" class="form-label">OMR Sheet Image</label>
+                        <input type="file" class="form-control" id="file" name="file" accept="image/*" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-lg">
+                        <i class="fas fa-cog fa-spin" id="spinner" style="display: none;"></i>
+                        <span id="btn-text">Process OMR Sheet</span>
+                    </button>
+                </form>
+                
+                <div id="result" class="mt-4" style="display: none;">
+                    <div class="alert alert-success">
+                        <h5>Processing Complete!</h5>
+                        <div id="result-content"></div>
+                    </div>
+                </div>
+                
+                <div id="error" class="mt-4" style="display: none;">
+                    <div class="alert alert-danger">
+                        <h5>Error!</h5>
+                        <div id="error-content"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.getElementById('uploadForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const formData = new FormData(this);
+    const spinner = document.getElementById('spinner');
+    const btnText = document.getElementById('btn-text');
+    const result = document.getElementById('result');
+    const error = document.getElementById('error');
+    
+    // Show loading state
+    spinner.style.display = 'inline';
+    btnText.textContent = 'Processing...';
+    result.style.display = 'none';
+    error.style.display = 'none';
+    
+    fetch('/upload', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            document.getElementById('result-content').innerHTML = `
+                <p><strong>Student ID:</strong> ${data.student_id}</p>
+                <p><strong>Exam Version:</strong> ${data.exam_version}</p>
+                <p><strong>Total Score:</strong> ${data.total_score}/100</p>
+                <div class="row">
+                    <div class="col-md-6">
+                        <h6>Subject-wise Scores:</h6>
+                        <ul>
+                            <li>Subject 1: ${data.scores.subject1}/20</li>
+                            <li>Subject 2: ${data.scores.subject2}/20</li>
+                            <li>Subject 3: ${data.scores.subject3}/20</li>
+                            <li>Subject 4: ${data.scores.subject4}/20</li>
+                            <li>Subject 5: ${data.scores.subject5}/20</li>
+                        </ul>
+                    </div>
+                </div>
+            `;
+            result.style.display = 'block';
+        } else {
+            document.getElementById('error-content').textContent = data.error;
+            error.style.display = 'block';
+        }
+    })
+    .catch(err => {
+        document.getElementById('error-content').textContent = 'Network error: ' + err.message;
+        error.style.display = 'block';
+    })
+    .finally(() => {
+        spinner.style.display = 'none';
+        btnText.textContent = 'Process OMR Sheet';
+    });
+});
+</script>
+{% endblock %}
+        ''')
+    
+    # Create other template files...
+    with open('templates/dashboard.html', 'w') as f:
+        f.write('''
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-4">
+        <div class="card text-center">
+            <div class="card-body">
+                <h1 class="text-primary">{{ total_students }}</h1>
+                <p class="card-text">Total Students</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card text-center">
+            <div class="card-body">
+                <h1 class="text-success">{{ avg_score }}</h1>
+                <p class="card-text">Average Score</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5>Exam Versions</h5>
+            </div>
+            <div class="card-body">
+                {% for version, count in version_stats %}
+                <p>Version {{ version }}: {{ count }} students</p>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+        ''')
+    
+    print("Starting OMR Evaluation System...")
+    print("Visit http://127.0.0.1:5000 to access the application")
+    app.run(debug=True)
